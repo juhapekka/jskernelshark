@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="en">
+        <head>
+                <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+                <meta name="format-detection" content="telephone=no" />
+                <script type="text/javascript" src="zlib.min.js"></script>
+                <title>trace-cmd analyzer</title>
+        </head>
+        <body>
+                <div class="header" id="header" style="background-color:#AAF;position: fixed;top: 0;width: 100%;padding: 8px 16px;">trace-cmd analyzer</div>
+                <div id="tracecontent" style="background-color:#CCC;padding: 40px 0px;"></div>
+        </body>
+        <script type="text/javascript">
+                /*
+                 * globals
+                 */
+                var TRACECMD_MAGIC = [23, 8, 68];
+
+                let enc = new TextEncoder();
+                let TRACING_STR	= enc.encode("tracing");
+                let HEAD_PAGE_STR = enc.encode("header_page");
+                let HEAD_PAGE_EVENT = enc.encode("header_event");
+                let HEAD_OPTIONS = enc.encode("options  ");
+                let HEAD_LATENCY = enc.encode("latency  ");
+                let HEAD_FLYRECORD = enc.encode("flyrecord");
+
+                var TRACECMD_FILE_ALLOCATED = 0;
+                var TRACECMD_FILE_INIT = 1;
+                var TRACECMD_FILE_HEADERS = 2;
+                var TRACECMD_FILE_FTRACE_EVENTS = 3;
+                var TRACECMD_FILE_ALL_EVENTS = 4;
+                var TRACECMD_FILE_KALLSYMS = 5;
+                var TRACECMD_FILE_PRINTK = 6;
+                var TRACECMD_FILE_CMD_LINES = 7;
+                var TRACECMD_FILE_CPU_COUNT = 8;
+                var TRACECMD_FILE_OPTIONS = 9;
+                var TRACECMD_FILE_CPU_LATENCY = 10;
+                var TRACECMD_FILE_CPU_FLYRECORD = 11;
+
+                var TRACECMD_OPTION_DONE = 0;
+                var TRACECMD_OPTION_DATE = 1;
+                var TRACECMD_OPTION_CPUSTAT = 2;
+                var TRACECMD_OPTION_BUFFER = 3;
+                var TRACECMD_OPTION_TRACECLOCK = 4;
+                var TRACECMD_OPTION_UNAME = 5;
+                var TRACECMD_OPTION_HOOK = 6;
+                var TRACECMD_OPTION_OFFSET = 7;
+                var TRACECMD_OPTION_CPUCOUNT = 8;
+                var TRACECMD_OPTION_VERSION = 9;
+                var TRACECMD_OPTION_PROCMAPS = 10;
+                var TRACECMD_OPTION_TRACEID = 11;
+                var TRACECMD_OPTION_TIME_SHIFT = 12;
+                var TRACECMD_OPTION_GUEST = 13;
+                var TRACECMD_OPTION_TSC2NSEC = 14;
+                var TRACECMD_OPTION_STRINGS = 15;
+                var TRACECMD_OPTION_HEADER_INFO = 16;
+                var TRACECMD_OPTION_FTRACE_EVENTS = 17;
+                var TRACECMD_OPTION_EVENT_FORMATS = 18;
+                var TRACECMD_OPTION_KALLSYMS = 19;
+                var TRACECMD_OPTION_PRINTK = 20;
+                var TRACECMD_OPTION_CMDLINES = 21;
+                var TRACECMD_OPTION_BUFFER_TEXT = 22;
+                var TRACECMD_OPTION_MAX = 23;
+
+                var TRACECMD_SEC_FL_COMPRESS	= 1; // the section is compressed
+
+                var TRACECMD_FL_IGNORE_DATE = (1 << 0);
+                var TRACECMD_FL_BUFFER_INSTANCE	= (1 << 1);
+                var TRACECMD_FL_IN_USECS = (1 << 2);
+                var TRACECMD_FL_RAW_TS = (1 << 3);
+                var TRACECMD_FL_SECTIONED = (1 << 4);
+                var TRACECMD_FL_COMPRESSION = (1 << 5);
+
+                var DUMP_SIZE = 1024;
+
+
+                var TEP_EVENT_FL_ISFTRACE = 0x01;
+                var TEP_EVENT_FL_ISPRINT = 0x02;
+                var TEP_EVENT_FL_ISBPRINT = 0x04;
+                var TEP_EVENT_FL_ISFUNCENT = 0x10;
+                var TEP_EVENT_FL_ISFUNCRET = 0x20;
+                var TEP_EVENT_FL_NOHANDLE = 0x40;
+                var TEP_EVENT_FL_PRINTRAW = 0x80;
+
+                var TEP_EVENT_FL_FAILED = 0x80000000;
+
+                var TEP_FIELD_IS_ARRAY = 1;
+                var TEP_FIELD_IS_POINTER = 2;
+                var TEP_FIELD_IS_SIGNED = 4;
+                var TEP_FIELD_IS_STRING = 8;
+                var TEP_FIELD_IS_DYNAMIC = 16;
+                var TEP_FIELD_IS_LONG = 32;
+                var TEP_FIELD_IS_FLAG = 64;
+                var TEP_FIELD_IS_SYMBOLIC = 128;
+                var TEP_FIELD_IS_RELATIVE = 256;
+
+
+                /*
+                 * tools
+                 */
+                let SETERR = (err) => {document.getElementById("header").style.backgroundColor = 'red'; alert(err);} //highlight if something went wrong.
+                let checkval = (file, val) => {let rval = val.every((value, index) => {return value == file.content[file.fpos + index]}); file.fpos += val.length; return rval;};
+//                let readstring = (file) => {let rval = ""; while(file.content[file.fpos] != 0){rval += String.fromCharCode(file.content[file.fpos++]);} file.fpos++; return rval;};
+
+
+
+                /*
+
+                struct cpu_data {
+	// the first two never change
+	unsigned long long	file_offset;
+	unsigned long long	file_size;
+	unsigned long long	offset;
+	unsigned long long	size;
+	unsigned long long	timestamp;
+	unsigned long long	first_ts;
+	struct list_head	page_maps;
+	struct page_map		*page_map;
+	struct page		**pages;
+	struct tep_record	*next;
+	struct page		*page;
+	struct kbuffer		*kbuf;
+	int			nr_pages;
+	int			page_cnt;
+	int			cpu;
+	int			pipe_fd;
+	struct cpu_zdata	compress;
+};
+*/
+
+                /*
+                 * file variables
+                 */
+                let filelist = [];
+                let newfile = (fname) => {
+                        file = {
+                                filename: fname,        // filename
+                                fpos:0,                 // simulate c-style read
+                                content:"",             // loaded full file content
+
+                                optionsoffset:0,        // options offset
+
+                                compressedblock:false,  // if compressed block is valid
+                                block:"",               // if compressed block was inflated it will be here
+
+                                endianness:0,           // file endianness. True = Big, False = Little
+                                bytes_per_long:0,       // bytes per long int in file
+                                file_page_size:0,       // file storage page size
+                                use_trace_clock:false,
+                                use_trace_clock:0,
+
+                                zname:"",               // compression name
+                                zversion:"",            // compression version
+
+                                metastrings:[],         // actual meta strings
+
+                                sections:[],            // file sections
+
+                                uname:"",
+                                version:"",
+                                cpustats:"",
+                                cpus:0,
+                                max_cpu:0,
+                                trace_id:0,
+                                ts2secs:0,
+                                tsc_calc: {
+                                        mult:0,
+                                        shift:0,
+                                        offset:0
+                                },
+
+                                file_state:"",
+
+                                events:[]               //format events
+
+                        };
+
+                        filelist.push(file);
+                        return file;
+                };
+
+                let readstring = (file) => 
+                {
+                        let rval = ""; 
+                        var fpos;
+                        var loc;
+
+                        if (file.compressedblock == true) {
+                                loc = file.block;
+                                fpos = file.compressedblockpos;
+                        } else {
+                                loc = file.content;
+                                fpos = file.fpos;
+                        }
+
+                        while(loc[fpos] != 0) {
+                                rval += String.fromCharCode(loc[fpos++]);
+                        } 
+                        
+                        fpos++;
+
+                        if (file.compressedblock == true)
+                                file.compressedblockpos = fpos;
+                        else 
+                                file.fpos = fpos;
+
+                         return rval;
+                };
+
+
+                let readnumber = (file, size, restore=false, plusoffset=0) => {
+                        var rval;
+                        var fpos;
+                        var loc;
+
+                        if (file.compressedblock == true) {
+                                loc = file.block;
+                                fpos = file.compressedblockpos + plusoffset;
+                        } else {
+                                loc = file.content;
+                                fpos = file.fpos + plusoffset;
+                        }
+
+                        switch (size) {
+                        case 8:
+                                rval = Number(new BigUint64Array(loc.slice(fpos, fpos+8).buffer)[0]);
+                                break;
+                        case 4:
+                                rval = new Uint32Array(loc.slice(fpos, fpos+4).buffer)[0];
+                                break;
+                        case 2:
+                                rval = new Uint16Array(loc.slice(fpos, fpos+2).buffer)[0];
+                                break;
+                        default:
+                                rval = loc[fpos];
+                        }
+
+                        fpos += size;
+
+                        if (restore == false) {
+                                if (file.compressedblock == true)
+                                        file.compressedblockpos = fpos;
+                                else 
+                                        file.fpos = fpos;
+                        }
+
+                        return rval;
+                }
+
+                function getbuf(file, size) {
+                        let rval = "";
+
+                        if (file.compressedblock == true) {
+                                rval = file.block.slice(file.compressedblockpos, file.compressedblockpos + size);
+                                file.compressedblockpos += size;
+                        } else {
+                                rval = file.content.slice(file.fpos, file.fpos + size);
+                                file.fpos += size;
+                        }
+
+                        return rval;
+                }
+
+                function uncompressblock(file) {
+                        let csize = readnumber(file, 4);
+                        let rsize = readnumber(file, 4);
+
+                        var inflate = new Zlib.Inflate(file.content.slice(file.fpos, file.fpos + csize));
+                        file.block = inflate.decompress();
+
+                        file.compressedblock = true;
+                        file.compressedblockpos = 0;
+                }
+
+
+                function read_metadata_strings(file, rsize) {
+                        var metastrings;
+                        
+                        if (file.compressedblock == true)
+                                metastrings = (new TextDecoder).decode(file.block).split("\0").filter(function (el) {return el != '';});
+
+                                /*
+                                 * FIXME
+                                 */
+                                /*
+                        else
+                                metastrings = (new TextDecoder).decode(file.block)
+                                */
+                        file.metastrings.push(...metastrings);
+                }
+
+                function get_meta_strings(file) {
+                        var id, fl, desc_id, size, csize, rsize;
+
+                        offset = file.fpos;
+
+                        do {
+                                id = readnumber(file, 2);
+                                fl = readnumber(file, 2);
+                                desc_id = readnumber(file, 4);
+                                size = readnumber(file, 8);
+
+                                if (id == TRACECMD_OPTION_STRINGS) {
+                                        if ((fl & TRACECMD_SEC_FL_COMPRESS)) {
+                                                csize = readnumber(file, 4, true);
+                                                rsize = readnumber(file, 4, true, 4);
+
+                                                uncompressblock(file)
+                                        } else {
+                                                rsize = size;
+                                        }
+                                        read_metadata_strings(file, rsize);
+                                        file.compressedblock = false;
+                                } else {
+                                        file.fpos += size;
+                                        if (file.fpos >= file.content.length)
+                                                break;
+                                }
+                        } while (1);
+
+                        file.fpos = offset;
+                }
+
+                function get_metadata_string(file, desc) {
+                        var counter = 0;
+                        for (var i = 0; i < file.metastrings.length; i++) {
+                                counter += file.metastrings[i].length + 1;
+                                if (counter >= desc)
+                                        return file.metastrings[i];
+                        }
+                        return "unknown";
+                }
+
+                function walk_v7(file) {
+                        var id, fl, desc_id, size, csize, rsize;
+                        var desc;
+                        var count = 0;
+
+                        let offset = file.fpos;
+
+                        do {
+                                soffset = file.fpos;
+
+                                id = readnumber(file, 2);
+                                fl = readnumber(file, 2);
+
+                                desc_id = readnumber(file, 4);
+                                desc = get_metadata_string(file, desc_id);
+
+                                size = readnumber(file, 8);
+
+                                if (id >= TRACECMD_OPTION_MAX)
+                                        console.log("unknown section id " + id + ": " + desc);
+
+                                count++;
+                                if (fl & TRACECMD_SEC_FL_COMPRESS) {
+                                        if (id == TRACECMD_OPTION_BUFFER || id == TRACECMD_OPTION_BUFFER_TEXT) {
+                                                console.log("[Section " + id + " @ " + soffset + "\t\"" + desc + "\", flags " + fl + ", " + size + " compressed bytes]");
+
+                                        } else {
+                                                csize = readnumber(file, 4);
+                                                rsize = readnumber(file, 4);
+                                                console.log("[Section " + id + " @ " + soffset + "\t\"" + desc + "\", flags " + fl + ", " + csize + " compressed " + rsize + " uncompressed]");
+                                                size -= 8;
+                                        }
+                                } else {
+                                        console.log("[Section " + id + " @ " + soffset + "\t\"" + desc + "\", flags " + fl + ", " + size + " bytes]");
+                                }
+
+                                file.fpos += size;
+                                if (file.fpos >= file.content.length)
+                                        break;
+                        } while (1);
+
+                        file.fpos = offset;
+                }
+
+                function dump_section_header(file) {
+                        var id, fl, desc_id;
+                        var desc;
+
+                        let offset = file.fpos;
+
+                        id = readnumber(file, 2);
+                        fl = readnumber(file, 2);
+                        desc_id = readnumber(file, 4);
+
+                        desc = get_metadata_string(file, desc_id);
+
+                        return fl;
+                }
+
+
+                function dump_options(file) {
+                        let flags = dump_section_header(file);
+                        /*
+                         * FIXME
+                         */
+                }
+
+                function read_section_header(file) {
+                        var id, fl, desc_id;
+                        var desc;
+                        var rval = {};
+
+                        rval.id = readnumber(file, 2);
+                        rval.fl = readnumber(file, 2);
+
+                        rval.desc_id = readnumber(file, 4);
+                        rval.desc = get_metadata_string(file, desc_id);
+                        rval.size = readnumber(file, 8);
+
+                        return rval;
+                }
+
+                function getsection(file, id) {
+                        for (index in file.sections) {
+                                if (file.sections[index].id == id)
+                                        return file.sections[index];
+                        }
+                }
+
+                function section_add_or_update(file, id, flags, offset, data_offset) {
+                        let section = getsection(file, id);
+
+                        if (typeof section == "undefined") {
+                                section = {id:id};
+                                file.sections.push(section);
+                        }
+
+                        if (offset)
+                                section.offset = offset;
+                        if (data_offset)
+                                section.data_offset = data_offset;
+                        if (flags >= 0)
+                                section.flags = flags;
+                }
+
+                function tracecmd_parse_trace_clock(file, buf, size) {
+                        file.trace_clock = new TextDecoder().decode(buf).split(' ').find(txt => { return txt.startsWith('[')} ).replace(/[\[|\]]/g, '');
+
+                        if (typeof file.trace_clock == 'undefined')
+                                return;
+
+                        if (file.flags & TRACECMD_FL_RAW_TS)
+		                file.flags &= ~TRACECMD_FL_IN_USECS;
+
+                        if (file.tsc_calc.mult)
+                		return;
+
+                        if (!(file.trace_clock in ["local", "global", "uptime", "perf", "mono", "tsc2nsec", "tai"]))
+                                file.flags &= ~TRACECMD_FL_IN_USECS;
+                }
+
+                function tracecmd_print_stats(file) {
+                        if (typeof file.cpustats == 'undefined' || file.cpustats.length == 0)
+                                console.log("No stats in this file");
+                        else
+                                console.log(file.cpustats);
+                        
+                        for (i = 0; i < file.cpus; i++) {
+                                console.log(file.cpu_data[i].file_offset)
+                                console.log(file.cpu_data[i].file_size)
+                        }
+                }
+
+
+                function handle_options(file) {
+                        headers = read_section_header(file);
+
+                        if (headers.id != TRACECMD_OPTION_DONE)
+                                return;
+
+                        if (headers.fl & TRACECMD_SEC_FL_COMPRESS)
+                                uncompressblock(file);
+
+                        for (;;) {
+                                let option = readnumber(file, 2);
+                                let size = readnumber(file, 4);
+
+                                let buf = getbuf(file, size);
+
+                                switch (option) {
+                                case TRACECMD_OPTION_FTRACE_EVENTS:
+                                case TRACECMD_OPTION_EVENT_FORMATS:
+                                case TRACECMD_OPTION_KALLSYMS:
+                                case TRACECMD_OPTION_PRINTK:
+                                case TRACECMD_OPTION_CMDLINES:
+                                case TRACECMD_OPTION_HEADER_INFO:
+                                        if (size < 8)
+                                                break;
+                                        section_add_or_update(file, option, -1, Number(new BigUint64Array(buf.slice(0, 8).buffer)[0]), 0);
+                                        break;
+                                case TRACECMD_OPTION_TRACECLOCK:
+                                        tracecmd_parse_trace_clock(file, buf, size);
+                                        if (!file.ts2secs)
+	                			file.use_trace_clock = true;
+                                        break;
+                                case TRACECMD_OPTION_UNAME:
+                                        file.uname = new TextDecoder().decode(buf);
+                                        break;
+                                case TRACECMD_OPTION_VERSION:
+                                        file.version = new TextDecoder().decode(buf);
+                                        break;
+                                case TRACECMD_OPTION_TRACEID:
+                                        if (size < 8)
+                                                break;
+                                        file.trace_id = Number(new BigUint64Array(buf.slice(0, 8).buffer)[0]);
+                                        break;
+                                case TRACECMD_OPTION_CPUCOUNT:
+                                        file.cpus = Number(new Uint32Array(buf.slice(0, 4).buffer)[0]);
+                                        if (file.cpus > file.max_cpu)
+                                                file.max_cpu = file.cpus;
+                                        console.log("TRACECMD_OPTION_CPUCOUNT " + file.cpus);
+                                        break;
+                                case TRACECMD_OPTION_CPUSTAT:
+                                        tracecmd_print_stats(file);
+                                        break;
+                                case TRACECMD_OPTION_DATE:
+                                case TRACECMD_OPTION_OFFSET:
+                                case TRACECMD_OPTION_TIME_SHIFT:
+                                case TRACECMD_OPTION_BUFFER:
+                                case TRACECMD_OPTION_BUFFER_TEXT:
+                                case TRACECMD_OPTION_HOOK:
+                                case TRACECMD_OPTION_PROCMAPS:
+                                case TRACECMD_OPTION_GUEST:
+                                case TRACECMD_OPTION_TSC2NSEC:
+                                        console.log("unhandled event id: " + option);
+                                        break;
+                                case TRACECMD_OPTION_DONE:
+                                        file.compressedblock = false;
+                                        file.block = undefined;
+                                        return;
+                                default:
+                                        console.log("!!! unknown option " + option);
+                                        break;
+                                }
+                        }
+
+                        file.compressedblock = false;
+                }
+
+                function load_v7(file) {
+//                        return new Promise((resolve) => {
+                                file.optionsoffset = readnumber(file, 8);     //option offset
+
+                                get_meta_strings(file);
+
+                                walk_v7(file);
+
+                                file.fpos = file.optionsoffset;
+
+                                dump_options(file);
+
+                                const nIntervId = setInterval(() => {
+
+/*                                if (i >= lines.length) {
+                                        if (dmesgdivi == null)
+                                        divvi.appendChild(newdiv);
+                                        else {
+                                        divvi.replaceWith(newdiv);
+                                        }
+                                
+                                        divvi.disabled = false;
+                                        dmesgdivi = newdiv;
+                                        clearInterval(nIntervId);
+                                        resolve();
+                                }*/
+                                        clearInterval(nIntervId);
+//                                        resolve();
+
+                                }, 1);
+  //                      });
+                }
+
+/*
+static enum tep_event_type get_type(int ch)
+{
+	if (ch == '\n')
+		return TEP_EVENT_NEWLINE;
+	if (isspace(ch))
+		return TEP_EVENT_SPACE;
+	if (isalnum(ch) || ch == '_')
+		return TEP_EVENT_ITEM;
+	if (ch == '\'')
+		return TEP_EVENT_SQUOTE;
+	if (ch == '"')
+		return TEP_EVENT_DQUOTE;
+	if (!isprint(ch))
+		return TEP_EVENT_NONE;
+	if (ch == '(' || ch == ')' || ch == ',')
+		return TEP_EVENT_DELIM;
+
+	return TEP_EVENT_OP;
+}*/
+
+/*
+name: user_stack
+ID: 12
+format:
+	field:unsigned short common_type;	offset:0;	size:2;	signed:0;
+	field:unsigned char common_flags;	offset:2;	size:1;	signed:0;
+	field:unsigned char common_preempt_count;	offset:3;	size:1;	signed:0;
+	field:int common_pid;	offset:4;	size:4;	signed:1;
+
+	field:unsigned int tgid;	offset:8;	size:4;	signed:0;
+	field:unsigned long caller[8];	offset:16;	size:64;	signed:0;
+
+print fmt: "\t=> %ps\n\t=> %ps\n\t=> %ps\n" "\t=> %ps\n\t=> %ps\n\t=> %ps\n" "\t=> %ps\n\t=> %ps\n", (void *)REC->caller[0], (void *)REC->caller[1], (void *)REC->caller[2], (void *)REC->caller[3], (void *)REC->caller[4], (void *)REC->caller[5], (void *)REC->caller[6], (void *)REC->caller[7]
+
+---
+
+
+name: bprint
+ID: 6
+format:
+	field:unsigned short common_type;	offset:0;	size:2;	signed:0;
+	field:unsigned char common_flags;	offset:2;	size:1;	signed:0;
+	field:unsigned char common_preempt_count;	offset:3;	size:1;	signed:0;
+	field:int common_pid;	offset:4;	size:4;	signed:1;
+
+	field:unsigned long ip;	offset:8;	size:8;	signed:0;
+	field:const char * fmt;	offset:16;	size:8;	signed:0;
+	field:u32 buf[];	offset:24;	size:0;	signed:0;
+
+print fmt: "%ps: %s", (void *)REC->ip, REC->fmt
+---
+*/
+
+                function event_read_fields(file, event, parts, startline) {
+                        let i = startline;
+
+                        let field = {
+                                event:event,
+                                flags:0
+                        };
+
+                        let firstfield = field;
+
+                        for (; i < parts.length; i++) {
+
+                                if (parts[i].length <= 0)
+                                        return {field:firstfield.next,counter:i};
+
+                                subs = parts[i].trim().split(";");
+                                subs[0] = subs[0].split(':')[1];
+
+                                field.next = {
+                                        event:event,
+                                        flags:0
+                                };
+                                field = field.next;
+
+
+                                if (subs[0].includes('__attribute__')) {
+                                        subs[0] = subs[0].replace('__attribute__', '').replace(/[\(\)]/g).trim();
+                                }
+
+                                if (event.flags & TEP_EVENT_FL_ISFTRACE && subs[0].includes('*')) {
+                                        field.flags |= TEP_FIELD_IS_POINTER;
+                                        field.type = subs[0].split('*')[0].trim();
+                                } else {
+                                        field.type = subs[0].trim().split(' ').slice(0,-1).join(' ');
+                                }
+
+                                let subsubparts = subs[0].trim().split(' ');
+                                field.name = field.alias = subsubparts[subsubparts.length - 1];
+
+                                if (subs[0].includes('[')) {
+                                        field.flags |= TEP_FIELD_IS_ARRAY;
+                                        field.arraylen = Number(subs[0].match(/\[(.*?)\]/)[1]);
+                                        field.name += subs[0].match(/\[(.*?)\]/)[0];
+                                        field.alias = field.name;
+ 
+                                        if (field.type.includes("char") || field.type.includes("u8") || field.type.includes("s8"))
+                                                field.flags |= TEP_FIELD_IS_STRING;
+                                }
+
+                                if (field.type.includes("__data_loc"))
+                                        field.flags |= TEP_FIELD_IS_DYNAMIC;
+
+                                if (field.type.includes("__rel_loc"))
+                                        field.flags |= TEP_FIELD_IS_DYNAMIC | TEP_FIELD_IS_RELATIVE;
+
+                                if (field.type.includes("long"))
+                                        field.flags |= TEP_FIELD_IS_LONG;
+
+                                field.offset = Number(subs[1].split("offset:")[1]);
+                                field.size = Number(subs[2].split("size:")[1]);
+
+                                if (Number(subs[3].split("signed:")[1]) == 1)
+                                        field.flags |= TEP_FIELD_IS_SIGNED;
+
+                                if (field.flags & TEP_FIELD_IS_ARRAY) {
+                                        if (field.arraylen)
+                                                field.elementsize = field.size / field.arraylen;
+                                        else if (field.flags & TEP_FIELD_IS_DYNAMIC)
+                                                field.elementsize = 1;//typesize(field.type);
+                                        else if (field.flags & TEP_FIELD_IS_STRING)
+                                                field.elementsize = 1;
+                                        else if (field.flags & TEP_FIELD_IS_LONG)
+                                                field.elementsize = file.bytes_per_long;
+                                } else
+                                        field.elementsize = field.size;
+                        }
+
+                        return {field:firstfield.next,counter:i};
+                }
+
+                function parse_format(file, buf, sys) {
+                        let event = {
+                                flags:0,
+                                format:{}
+                        };
+
+                        let parts = buf.split("\n");
+
+                        let substrings = parts[0].split(":");
+                        if (substrings[0] == "name")
+                                event.name = substrings[1].trim();
+                        else
+                                throw ("parseformat nameparsing fail: " + buf);
+
+                        if (sys == "ftrace") {
+                                event.flags |= TEP_EVENT_FL_ISFTRACE;
+
+                                if (event.name.includes("bprint") == 0)
+                                      event.flags |= TEP_EVENT_FL_ISBPRINT;
+                        }
+
+                        substrings = parts[1].split(":");
+                        if (substrings[0] == "ID")
+                                event.id = Number(substrings[1].trim());
+                        else
+                                throw ("parseformat ID parsing fail: " + buf);
+                        
+                        event.system = sys;
+
+                        substrings = parts[2].split(":");
+                        if (substrings[0] != "format")
+                                throw ("parseformat format parsing fail: " + buf);
+
+                        let rval = event_read_fields(file, event, parts, 3);
+                        event.format.common_fields = rval.field;
+                        rval = event_read_fields(file, event, parts, rval.counter + 1);
+                        event.format.fields = rval.field;
+                        
+                        file.events.push(event);
+                }
+
+
+
+                function read_ftrace_files(file, section) {
+                        let count = readnumber(file, 4);
+
+                        for (var i = 0; i < count; i++) {
+                                let size = readnumber(file, 8);
+
+                                let buf = (new TextDecoder).decode(getbuf(file, size));
+                                parse_format(file, buf, "ftrace");
+                        }
+                }
+
+                function read_event_files(file) {
+                        let systems = readnumber(file, 4);
+
+                        for (var i = 0; i < systems; i++) {
+                                let system = readstring(file);
+
+//                                console.log(system);
+
+                                let sys_printed = 0;
+                		let print_all = 0;
+
+                                let count = readnumber(file, 4);
+
+                                for (var x = 0; x < count; x++) {
+                                        let size = readnumber(file, 8);
+
+                                        let buf = (new TextDecoder).decode(getbuf(file, size));
+                                        console.log(buf);
+                                        parse_format(file, buf, system);
+                                }
+                        }
+                }
+
+                function read_proc_kallsyms(file) {
+                        let size = readnumber(file, 4);
+
+                        if (size == 0)
+                                return;
+
+                        let buf = (new TextDecoder).decode(getbuf(file, size));
+
+                        let parts = buf.split('\n');
+
+                        for (var i = 0; i < parts.length; i++) {
+                                let mod = undefined;
+
+                                let lineparts = buf.split(' ');
+
+                                console.log(parts[i]);
+
+// 0000000000015018 A cpu_llc_shared_map
+// ffffffffa0014a20 T drm_atomic_get_connector_state	[drm]
+
+                                //sscanf(line, "%16llx %c %n%*s%n%*1[\t][%n%*s%n",
+//			   &addr, &ch, &func_start, &func_end, &mod_start, &mod_end);
+                        }
+                }
+
+
+                function handle_sections(file, section) {
+                        file.fpos = section.offset;
+
+                        let headercheck = read_section_header(file);
+
+                        section.flags = headercheck.fl;
+
+                        if (headercheck.id != section.id) {
+                                console.log("section id mismatch!! " + headercheck.sec_id + " != " + section.id);
+                                return;
+                        }
+
+                        section.data_offset = file.fpos;
+
+                        if (section.flags  & TRACECMD_SEC_FL_COMPRESS)
+                                uncompressblock(file);
+
+                        switch(section.id) {
+                                case TRACECMD_OPTION_HEADER_INFO:
+                                        console.log("ret = read_header_files(handle);");
+                                        break;
+                                case TRACECMD_OPTION_FTRACE_EVENTS:
+//                                console.log("ret = read_ftrace_files(handle, regex);");
+                                        read_ftrace_files(file, section);
+                                        break;
+                                case TRACECMD_OPTION_EVENT_FORMATS:
+//                                console.log("ret = read_event_files(handle, regex);");
+                                        read_event_files(file);
+                                        break;
+                                case TRACECMD_OPTION_KALLSYMS:
+                                        read_proc_kallsyms(file);
+                                        console.log("ret = read_proc_kallsyms(handle);");
+                                        break;
+                                case TRACECMD_OPTION_PRINTK:
+                                        console.log("ret = read_ftrace_printk(handle);");
+                                        break;
+                                case TRACECMD_OPTION_CMDLINES:
+                                        console.log("ret = read_and_parse_cmdlines(handle);");
+                                        break;
+                                default:
+                                        ret = 0;
+                                        break;
+                        }
+                        file.compressedblock = false;
+                }
+
+                function readheaders(file) {
+
+
+                        file.fpos = file.optionsoffset;
+                        handle_options(file);
+
+                        file.sections.forEach(section => {
+                                handle_sections(file, section);                                
+                        });
+
+/*
+	if (handle->options_init)
+		return 0;
+
+	if (!handle->options_start)
+		return -1;
+*/
+/*                        let buf = new TextDecoder().decode(getbuf(file, 10));
+
+                        if (buf.includes("options"))
+                                handle_options(file);
+*/
+
+                }
+
+                function loadFile(file) {
+                        if (!checkval(file, TRACECMD_MAGIC))
+                                throw("wrong file magic");
+
+                        if (!checkval(file, TRACING_STR))
+                                throw("wrong tracing string");
+
+                        let verstring = readstring(file);
+                        if (verstring != 7)
+                                throw("Unsupported file version; only 7 supported, file says " + verstring);
+
+                        file.endianness = !checkval(file, Uint8Array.from('0'))
+                        file.bytes_per_long = file.content[file.fpos++];
+
+                        file.file_page_size = readnumber(file, 4);
+
+                        // dump_cmpress
+                        file.zname = readstring(file);
+                        file.zversion = readstring(file);
+
+                        load_v7(file);//.then(() => {
+
+//                        file.fpos = file.optionsoffset;
+
+                        readheaders(file);
+                        /*
+                        handle_options(file);
+                        file.file_state = TRACECMD_FILE_OPTIONS;
+
+                        let buf = new TextDecoder().decode(getbuf(file, 10));
+
+                        if (buf.includes("latency"))
+                                file.file_state = TRACECMD_FILE_CPU_LATENCY;
+                        else if (buf.includes("flyrecord"))
+                                file.file_state = TRACECMD_FILE_CPU_FLYRECORD;
+                        else
+                                return -1;
+                        
+*/
+//                        });
+                }
+
+                async function readFile() {
+                        let input = document.createElement('input');
+                        input.type = 'file';
+
+                        input.onchange = async e => {
+                                let reader = new FileReader();
+
+                                let file = newfile(e.target.files[0].name);
+
+                                file.content = new Uint8Array(await e.target.files[0].arrayBuffer());
+
+                                file.fpos = 0;
+                                try {
+                                        loadFile(file);
+                                        document.getElementById("tracecontent").innerText = "HELLO";//file.content;
+                                } catch (err) {
+                                        SETERR(err)
+                                }
+                        }
+                        document.getElementById("header").appendChild(input);
+                }
+
+                readFile();
+
+        </script>
+</html>
